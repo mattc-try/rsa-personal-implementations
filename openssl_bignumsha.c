@@ -1,194 +1,215 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <openssl/bn.h>
-#include <openssl/sha.h>
-#include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <openssl/rsa.h>
+#include <openssl/pem.h>
+#include <openssl/err.h>
 
-// Key structure to hold RSA components
-typedef struct {
-    BIGNUM *n;  // modulus
-    BIGNUM *e;  // public exponent
-    BIGNUM *d;  // private exponent
-    BIGNUM *p;  // prime p
-    BIGNUM *q;  // prime q
-} RSAKey;
-
-// Generate RSA keys (n, e, d, p, q)
-RSAKey keyGen(int bits) {
-    RSAKey key;
-    BN_CTX *ctx = BN_CTX_new();
-    BIGNUM *phi = BN_new();
-    BIGNUM *p_minus_1 = BN_new();
-    BIGNUM *q_minus_1 = BN_new();
-
-    // Generate primes p and q (each bits/2)
-    key.p = BN_new();
-    key.q = BN_new();
-    BN_generate_prime_ex(key.p, bits/2, 0, NULL, NULL, NULL);
-    BN_generate_prime_ex(key.q, bits/2, 0, NULL, NULL, NULL);
-    
-    // Compute n = p * q
-    key.n = BN_new();
-    BN_mul(key.n, key.p, key.q, ctx);
-
-    // Compute phi(n) = (p-1)*(q-1)
-    BN_sub(p_minus_1, key.p, BN_value_one());
-    BN_sub(q_minus_1, key.q, BN_value_one());
-    BN_mul(phi, p_minus_1, q_minus_1, ctx);
-
-    // Choose e (usually 65537 is used, but here we generate a random e < phi)
-    key.e = BN_new();
-    // Get a random e with bit-length slightly less than phi
-    BN_rand(key.e, BN_num_bits(phi) - 1, 0, 0);
-    BN_add_word(key.e, 1); // Ensure e >= 2
-
-    // Ensure that gcd(e, phi) == 1
-    BIGNUM *gcd = BN_new();
-    BN_gcd(gcd, key.e, phi, ctx);
-    while (!BN_is_one(gcd)) {
-        BN_rand(key.e, BN_num_bits(phi) - 1, 0, 0);
-        BN_add_word(key.e, 1);
-        BN_gcd(gcd, key.e, phi, ctx);
+// Generate RSA key pair with 2048 bits
+EVP_PKEY* generate_rsa_key() {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
     }
-    BN_free(gcd);
-
-    // Compute d = e^-1 mod phi
-    key.d = BN_new();
-    BN_mod_inverse(key.d, key.e, phi, ctx);
-
-    // Cleanup
-    BN_free(phi);
-    BN_free(p_minus_1);
-    BN_free(q_minus_1);
-    BN_CTX_free(ctx);
-    return key;
-}
-
-// Encrypt: c = m^e mod n
-BIGNUM* encrypt(BIGNUM *m, BIGNUM *n, BIGNUM *e) {
-    BN_CTX *ctx = BN_CTX_new();
-    BIGNUM *c = BN_new();
-    BN_mod_exp(c, m, e, n, ctx);
-    BN_CTX_free(ctx);
-    return c;
-}
-
-// Decrypt: m = c^d mod n (same operation as encryption but with d)
-BIGNUM* decrypt(BIGNUM *c, BIGNUM *n, BIGNUM *d) {
-    return encrypt(c, n, d);
-}
-
-// Compute SHA-1 hash of string m
-void sha1_hash(const char *m, unsigned char *digest) {
-    SHA_CTX ctx;
-    SHA1_Init(&ctx);
-    SHA1_Update(&ctx, m, strlen(m));
-    SHA1_Final(digest, &ctx);
-}
-
-// Full hash H(m) truncated to (modulus_bits - 4) bits
-BIGNUM* fullHash(const char *m, int modulus_bits) {
-    int hash_bits = modulus_bits - 4;
-    int hex_chars_needed = (hash_bits + 3) / 4; // round up to hex digits
-    char *hex_str = malloc(hex_chars_needed + 1);
-    int idx = 0;
-
-    // Concatenate SHA-1 hashes until we have enough hex characters
-    while (idx < hex_chars_needed) {
-        char m_idx[256];
-        sprintf(m_idx, "%s%d", m, idx / 40); // Append an index to vary the hash input
-        unsigned char digest[SHA_DIGEST_LENGTH];
-        sha1_hash(m_idx, digest);
-
-        // Convert digest to hex string (40 hex characters)
-        char hex_block[41];
-        for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
-            sprintf(hex_block + 2 * i, "%02x", digest[i]);
-        }
-        hex_block[40] = '\0';
-
-        // Append up to 40 characters from hex_block to hex_str
-        int remaining = hex_chars_needed - idx;
-        int copy = (remaining > 40) ? 40 : remaining;
-        strncpy(hex_str + idx, hex_block, copy);
-        idx += copy;
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
     }
-    hex_str[hex_chars_needed] = '\0';
 
-    // Convert hex string to BIGNUM
-    BIGNUM *h = BN_new();
-    BN_hex2bn(&h, hex_str);
-    free(hex_str);
-    return h;
+    EVP_PKEY *pkey = NULL;
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+    EVP_PKEY_CTX_free(ctx);
+    return pkey;
 }
 
-// Sign message m: sigma = H(m)^d mod n
-BIGNUM* sign(const char *m, BIGNUM *n, BIGNUM *d) {
-    int modulus_bits = BN_num_bits(n);
-    BIGNUM *h = fullHash(m, modulus_bits);
-    BIGNUM *sigma = decrypt(h, n, d); // computes h^d mod n
-    BN_free(h);
-    return sigma;
+// Encrypt using RSA-OAEP with SHA256
+unsigned char* rsa_encrypt(EVP_PKEY *pkey, const unsigned char *msg, size_t msg_len, size_t *encrypted_len) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
+    if (!ctx || EVP_PKEY_encrypt_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+
+    size_t outlen;
+    if (EVP_PKEY_encrypt(ctx, NULL, &outlen, msg, msg_len) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+
+    unsigned char *encrypted = malloc(outlen);
+    if (!encrypted || EVP_PKEY_encrypt(ctx, encrypted, &outlen, msg, msg_len) <= 0) {
+        free(encrypted);
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+
+    *encrypted_len = outlen;
+    EVP_PKEY_CTX_free(ctx);
+    return encrypted;
 }
 
-// Verify signature: check if H(m) == sigma^e mod n
-int verify(BIGNUM *sigma, const char *m, BIGNUM *n, BIGNUM *e) {
-    int modulus_bits = BN_num_bits(n);
-    BIGNUM *h_calculated = fullHash(m, modulus_bits);
-    BIGNUM *h_recovered = encrypt(sigma, n, e);
-    int result = BN_cmp(h_calculated, h_recovered);
-    BN_free(h_calculated);
-    BN_free(h_recovered);
-    return (result == 0);
+// Decrypt using RSA-OAEP with SHA256
+unsigned char* rsa_decrypt(EVP_PKEY *pkey, const unsigned char *encrypted, size_t encrypted_len, size_t *decrypted_len) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
+    if (!ctx || EVP_PKEY_decrypt_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+
+    size_t outlen;
+    if (EVP_PKEY_decrypt(ctx, NULL, &outlen, encrypted, encrypted_len) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+
+    unsigned char *decrypted = malloc(outlen);
+    if (!decrypted || EVP_PKEY_decrypt(ctx, decrypted, &outlen, encrypted, encrypted_len) <= 0) {
+        free(decrypted);
+        EVP_PKEY_CTX_free(ctx);
+        return NULL;
+    }
+
+    *decrypted_len = outlen;
+    EVP_PKEY_CTX_free(ctx);
+    return decrypted;
 }
 
-// Test encryption/decryption
+// Sign using RSA-PSS with SHA256
+unsigned char* rsa_sign(EVP_PKEY *pkey, const unsigned char *msg, size_t msg_len, size_t *sig_len) {
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    if (!md_ctx || EVP_DigestSignInit(md_ctx, NULL, EVP_sha256(), NULL, pkey) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        return NULL;
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_padding(EVP_MD_CTX_pkey_ctx(md_ctx), RSA_PKCS1_PSS_PADDING) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_pss_saltlen(EVP_MD_CTX_pkey_ctx(md_ctx), -2) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        return NULL;
+    }
+
+    size_t sig_length;
+    if (EVP_DigestSign(md_ctx, NULL, &sig_length, msg, msg_len) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        return NULL;
+    }
+
+    unsigned char *sig = malloc(sig_length);
+    if (!sig || EVP_DigestSign(md_ctx, sig, &sig_length, msg, msg_len) <= 0) {
+        free(sig);
+        EVP_MD_CTX_free(md_ctx);
+        return NULL;
+    }
+
+    *sig_len = sig_length;
+    EVP_MD_CTX_free(md_ctx);
+    return sig;
+}
+
+// Verify signature using RSA-PSS with SHA256
+int rsa_verify(EVP_PKEY *pkey, const unsigned char *msg, size_t msg_len, const unsigned char *sig, size_t sig_len) {
+    EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
+    if (!md_ctx || EVP_DigestVerifyInit(md_ctx, NULL, EVP_sha256(), NULL, pkey) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        return -1;
+    }
+
+    if (EVP_PKEY_CTX_set_rsa_padding(EVP_MD_CTX_pkey_ctx(md_ctx), RSA_PKCS1_PSS_PADDING) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_pss_saltlen(EVP_MD_CTX_pkey_ctx(md_ctx), -2) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        return -1;
+    }
+
+    int result = EVP_DigestVerify(md_ctx, sig, sig_len, msg, msg_len);
+    EVP_MD_CTX_free(md_ctx);
+    return result;
+}
+
 void checkEnc() {
-    RSAKey key = keyGen(512);
-    BIGNUM *m = BN_new();
-    BN_rand(m, 512, 0, 0); // generate a random message
-    BN_CTX *ctx = BN_CTX_new();
-    BN_mod(m, m, key.n, ctx); // ensure m < n
-    BN_CTX_free(ctx);
-
-    BIGNUM *c = encrypt(m, key.n, key.e);
-    BIGNUM *m_decrypted = decrypt(c, key.n, key.d);
-
-    if (BN_cmp(m, m_decrypted)) {
-        printf("Encryption/Decryption FAILED\n");
-    } else {
-        printf("Encryption/Decryption OK\n");
+    EVP_PKEY *pkey = generate_rsa_key();
+    if (!pkey) {
+        printf("Key generation failed\n");
+        return;
     }
 
-    BN_free(m);
-    BN_free(c);
-    BN_free(m_decrypted);
-    BN_free(key.n);
-    BN_free(key.e);
-    BN_free(key.d);
-    BN_free(key.p);
-    BN_free(key.q);
+    const char *msg = "Hello, secure world!";
+    size_t msg_len = strlen(msg);
+    size_t encrypted_len, decrypted_len;
+
+    unsigned char *encrypted = rsa_encrypt(pkey, (const unsigned char*)msg, msg_len, &encrypted_len);
+    if (!encrypted) {
+        printf("Encryption failed\n");
+        EVP_PKEY_free(pkey);
+        return;
+    }
+
+    unsigned char *decrypted = rsa_decrypt(pkey, encrypted, encrypted_len, &decrypted_len);
+    if (!decrypted) {
+        printf("Decryption failed\n");
+        free(encrypted);
+        EVP_PKEY_free(pkey);
+        return;
+    }
+
+    if (decrypted_len == msg_len && memcmp(msg, decrypted, msg_len) == 0) {
+        printf("Encryption/Decryption OK\n");
+    } else {
+        printf("Encryption/Decryption FAILED\n");
+    }
+
+    free(encrypted);
+    free(decrypted);
+    EVP_PKEY_free(pkey);
 }
 
-// Test signature generation and verification
 void checkSig() {
-    RSAKey key = keyGen(512);
-    const char *msg = "message";
-    BIGNUM *sigma = sign(msg, key.n, key.d);
-    int result = verify(sigma, msg, key.n, key.e);
-    if (result) {
-        printf("Signature verification OK\n");
-    } else {
-        printf("Signature verification FAILED\n");
+    EVP_PKEY *pkey = generate_rsa_key();
+    if (!pkey) {
+        printf("Key generation failed\n");
+        return;
     }
 
-    BN_free(sigma);
-    BN_free(key.n);
-    BN_free(key.e);
-    BN_free(key.d);
-    BN_free(key.p);
-    BN_free(key.q);
+    const char *msg = "Test message";
+    size_t msg_len = strlen(msg);
+    size_t sig_len;
+
+    unsigned char *sig = rsa_sign(pkey, (const unsigned char*)msg, msg_len, &sig_len);
+    if (!sig) {
+        printf("Signing failed\n");
+        EVP_PKEY_free(pkey);
+        return;
+    }
+
+    int result = rsa_verify(pkey, (const unsigned char*)msg, msg_len, sig, sig_len);
+    if (result == 1) {
+        printf("Signature verification OK\n");
+    } else if (result == 0) {
+        printf("Signature verification FAILED\n");
+    } else {
+        printf("Verification error\n");
+    }
+
+    free(sig);
+    EVP_PKEY_free(pkey);
 }
 
 int main() {
